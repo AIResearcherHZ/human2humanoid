@@ -28,19 +28,84 @@
 
 import numpy as np
 
-from isaacgym.torch_utils import *
 import torch
 from torch import nn
 import phc.utils.pytorch3d_transforms as ptr
 import torch.nn.functional as F
 
 
-def project_to_norm(x, norm=5, z_type = "sphere"):
+# The following functions are copied from Isaac Lab to avoid dependency on it.
+# ---- Start of functions from Isaac Lab -----
+@torch.jit.script
+def quat_from_euler_xyz(roll: torch.Tensor, pitch: torch.Tensor, yaw: torch.Tensor) -> torch.Tensor:
+    """Convert rotations given as Euler angles in radians to Quaternions.
+
+    Note:
+        The euler angles are assumed in XYZ convention.
+
+    Args:
+        roll: Rotation around x-axis (in radians). Shape is (N,).
+        pitch: Rotation around y-axis (in radians). Shape is (N,).
+        yaw: Rotation around z-axis (in radians). Shape is (N,).
+
+    Returns:
+        The quaternion in (w, x, y, z). Shape is (N, 4).
+    """
+    cy = torch.cos(yaw * 0.5)
+    sy = torch.sin(yaw * 0.5)
+    cr = torch.cos(roll * 0.5)
+    sr = torch.sin(roll * 0.5)
+    cp = torch.cos(pitch * 0.5)
+    sp = torch.sin(pitch * 0.5)
+    # compute quaternion
+    qw = cy * cr * cp + sy * sr * sp
+    qx = cy * sr * cp - sy * cr * sp
+    qy = cy * cr * sp + sy * sr * cp
+    qz = sy * cr * cp - cy * sr * sp
+
+    return torch.stack([qw, qx, qy, qz], dim=-1)
+
+
+@torch.jit.script
+def normalize(x: torch.Tensor, eps: float = 1e-9) -> torch.Tensor:
+    """Normalizes a given input tensor to unit length.
+
+    Args:
+        x: Input tensor of shape (N, dims).
+        eps: A small value to avoid division by zero. Defaults to 1e-9.
+
+    Returns:
+        Normalized tensor of shape (N, dims).
+    """
+    return x / x.norm(p=2, dim=-1).clamp(min=eps, max=None).unsqueeze(-1)
+
+
+@torch.jit.script
+def quat_from_angle_axis(angle: torch.Tensor, axis: torch.Tensor) -> torch.Tensor:
+    """Convert rotations given as angle-axis to quaternions.
+
+    Args:
+        angle: The angle turned anti-clockwise in radians around the vector's direction. Shape is (N,).
+        axis: The axis of rotation. Shape is (N, 3).
+
+    Returns:
+        The quaternion in (w, x, y, z). Shape is (N, 4).
+    """
+    theta = (angle / 2).unsqueeze(-1)
+    xyz = normalize(axis) * theta.sin()
+    w = theta.cos()
+    return normalize(torch.cat([w, xyz], dim=-1))
+
+# ---- End of functions from Isaac Lab -----
+
+
+def project_to_norm(x, norm=5, z_type="sphere"):
     if z_type == "sphere":
         x = x / (torch.norm(x, dim=-1, keepdim=True) / norm + 1e-8)
     elif z_type == "uniform":
         x = torch.clamp(x, -norm, norm)
     return x
+
 
 @torch.jit.script
 def my_quat_rotate(q, v):
@@ -49,17 +114,21 @@ def my_quat_rotate(q, v):
     q_vec = q[:, :3]
     a = v * (2.0 * q_w**2 - 1.0).unsqueeze(-1)
     b = torch.cross(q_vec, v, dim=-1) * q_w.unsqueeze(-1) * 2.0
-    c = q_vec * \
-        torch.bmm(q_vec.view(shape[0], 1, 3), v.view(
-            shape[0], 3, 1)).squeeze(-1) * 2.0
+    c = q_vec * torch.bmm(q_vec.view(shape[0], 1, 3), v.view(shape[0], 3, 1)).squeeze(-1) * 2.0
     return a + b + c
+
+
+@torch.jit.script
+def normalize_angle(x):
+    return torch.atan2(torch.sin(x), torch.cos(x))
+
 
 @torch.jit.script
 def quat_to_angle_axis(q):
     # type: (Tensor) -> Tuple[Tensor, Tensor]
     # computes axis-angle representation from quaternion q
     # q must be normalized
-    # ZL: could have issues. 
+    # ZL: could have issues.
     min_theta = 1e-5
     qx, qy, qz, qw = 0, 1, 2, 3
 
@@ -141,7 +210,8 @@ def tan_norm_to_quat(tan_norm):
 @torch.jit.script
 def euler_xyz_to_exp_map(roll, pitch, yaw):
     # type: (Tensor, Tensor, Tensor) -> Tensor
-    q = quat_from_euler_xyz(roll, pitch, yaw)
+    q = quat_from_euler_xyz(roll, pitch, yaw)  # IsaacLab return wxyz
+    q = q.roll(-1, dims=-1)
     exp_map = quat_to_exp_map(q)
     return exp_map
 
@@ -169,7 +239,8 @@ def exp_map_to_angle_axis(exp_map):
 @torch.jit.script
 def exp_map_to_quat(exp_map):
     angle, axis = exp_map_to_angle_axis(exp_map)
-    q = quat_from_angle_axis(angle, axis)
+    q = quat_from_angle_axis(angle, axis)  # IsaacLab return wxyz
+    q = q.roll(-1, dims=-1)
     return q
 
 
@@ -223,7 +294,8 @@ def calc_heading_quat(q):
     axis = torch.zeros_like(q[..., 0:3])
     axis[..., 2] = 1
 
-    heading_q = quat_from_angle_axis(heading, axis)
+    heading_q = quat_from_angle_axis(heading, axis)  # IsaacLab return wxyz
+    heading_q = heading_q.roll(-1, dims=-1)
     return heading_q
 
 
@@ -237,15 +309,17 @@ def calc_heading_quat_inv(q):
     axis = torch.zeros_like(q[..., 0:3])
     axis[..., 2] = 1
 
-    heading_q = quat_from_angle_axis(-heading, axis)
+    heading_q = quat_from_angle_axis(-heading, axis)  # IsaacLab return wxyz
+    heading_q = heading_q.roll(-1, dims=-1)
     return heading_q
 
+
 def activation_facotry(act_name):
-    if act_name == 'relu':
+    if act_name == "relu":
         return nn.ReLU
-    elif act_name == 'tanh':
+    elif act_name == "tanh":
         return nn.Tanh
-    elif act_name == 'sigmoid':
+    elif act_name == "sigmoid":
         return nn.Sigmoid
     elif act_name == "elu":
         return nn.ELU
